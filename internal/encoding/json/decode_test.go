@@ -1194,6 +1194,32 @@ func TestDecoder(t *testing.T) {
 			},
 		},
 		{
+			in: `{""`,
+			want: []R{
+				{V: ObjectOpen},
+				{E: errEOF},
+			},
+		},
+		{
+			in: `{"":`,
+			want: []R{
+				{V: ObjectOpen},
+				{V: Name{""}},
+				{E: errEOF},
+			},
+		},
+		{
+			// An object close directly after a name is a missing value, not a
+			// valid close. Accepting it pops the open stack one level too far,
+			// after which Read hands out EOF tokens with a nil error forever.
+			in: `{"":}`,
+			want: []R{
+				{V: ObjectOpen},
+				{V: Name{""}},
+				{E: `syntax error (line 1:5): unexpected token }`},
+			},
+		},
+		{
 			in: `{"34":"89",}`,
 			want: []R{
 				{V: ObjectOpen},

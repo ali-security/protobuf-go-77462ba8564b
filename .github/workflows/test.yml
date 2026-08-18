@@ -2,7 +2,11 @@ on:
   workflow_dispatch:
     inputs:
       test-filter:
-        description: 'Space-separated test names to run instead of the full suite'
+        description: >-
+          Space-separated selector run instead of the full integration suite.
+          Tokens starting with "./" are package patterns, everything else is a
+          Go test name, e.g. "./encoding/protojson ./internal/encoding/json
+          TestUnmarshal TestDecoder". Empty runs the full suite.
         required: false
         default: ''
 name: Test
@@ -87,4 +91,34 @@ jobs:
         path: .cache
         key: ${{ runner.os }}-${{ hashFiles('integration_test.go') }}
     - name: Test
-      run: USE_BAZEL_VERSION=6.1.0 go test -v -timeout=60m -count=1 -failfast integration_test.go
+      shell: bash
+      env:
+        TEST_FILTER: ${{ inputs.test-filter }}
+      run: |
+        set -eu
+        if [ -z "$TEST_FILTER" ]; then
+          USE_BAZEL_VERSION=6.1.0 go test -v -timeout=60m -count=1 -failfast integration_test.go
+          exit 0
+        fi
+        # Scoped run: "./pkg/path" tokens select packages, the rest are test names.
+        pkgs=""
+        names=""
+        for tok in $TEST_FILTER; do
+          case "$tok" in
+            ./*) pkgs="$pkgs $tok" ;;
+            *)   names="$names${names:+|}$tok" ;;
+          esac
+        done
+        [ -n "$pkgs" ] || pkgs="./..."
+        [ -n "$names" ] || names=".*"
+        echo "Scoped test run: packages=[$pkgs] -run='^($names)$'"
+        go test -v -count=1 -timeout=30m -run "^($names)$" $pkgs 2>&1 | tee "$RUNNER_TEMP/scoped-test.log"
+        status=${PIPESTATUS[0]}
+        # Fail closed: every selected test name must have actually run.
+        for n in $(echo "$names" | tr '|' ' '); do
+          if [ "$n" != ".*" ] && ! grep -qE "^=== RUN +$n\$" "$RUNNER_TEMP/scoped-test.log"; then
+            echo "ERROR: selected test '$n' never ran"
+            status=1
+          fi
+        done
+        exit "$status"
