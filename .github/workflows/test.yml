@@ -1,4 +1,10 @@
-on: [push]
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Space-separated test names to run instead of the full suite'
+        required: false
+        default: ''
 name: Test
 jobs:
   test:
@@ -7,8 +13,13 @@ jobs:
         # This is just a version to compile the integration_test.go; see
         # golangVersions in that file for the list of actual Go versions used.
         go-version: [1.x]
-        os: [ubuntu-latest] # TODO: Add [macos-latest, windows-latest]
+        # ubuntu-latest is now 24.04 (GCC 13 / Python 3.12); v1.30.0 shipped when
+        # it was 22.04. GCC 13 turns a false-positive -Wstringop-overflow into a
+        # hard error under protobuf 22.0's -Werror bazel build, so pin the
+        # release-era image. ubuntu-22.04 is still a live GitHub-hosted label.
+        os: [ubuntu-22.04] # TODO: Add [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
     steps:
     - name: Install Linux dependencies
       if: runner.os == 'Linux'
@@ -17,12 +28,63 @@ jobs:
       uses: actions/setup-go@v3
       with:
         go-version: ${{ matrix.go-version }}
+    - name: Install Python
+      # protobuf 22.0's bazel build resolves rules_python against the system
+      # python3; its vendored setuptools calls pkgutil.ImpImporter, removed in
+      # Python 3.12. ubuntu-latest shipped Python 3.10 when v1.30.0 was
+      # released and now ships 3.12, so pin an interpreter from before the
+      # removal. Restores the release-era environment; no test command changes.
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
     - name: Checkout code
       uses: actions/checkout@v3
+    - name: Build module zip
+      run: |
+        set -eux
+        mkdir -p "$RUNNER_TEMP/modzip" "$RUNNER_TEMP/build_output"
+        cat > "$RUNNER_TEMP/modzip/create_mod.go" <<'GOEOF'
+        package main
+
+        import (
+            "log"
+            "os"
+
+            "golang.org/x/mod/module"
+            "golang.org/x/mod/zip"
+        )
+
+        func main() {
+            if len(os.Args) != 5 {
+                log.Fatal("usage: create_mod <module-path> <version> <source-dir> <output-zip>")
+            }
+            m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+            f, err := os.Create(os.Args[4])
+            if err != nil {
+                log.Fatal(err)
+            }
+            defer f.Close()
+            if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                log.Fatal(err)
+            }
+            log.Printf("created module zip: %s", os.Args[4])
+        }
+        GOEOF
+        cd "$RUNNER_TEMP/modzip"
+        go mod init example.com/modzip
+        GOFLAGS=-mod=mod GOTOOLCHAIN=local go get golang.org/x/mod@v0.9.0
+        GOFLAGS=-mod=mod GOTOOLCHAIN=local go run create_mod.go google.golang.org/protobuf v1.30.0 "$GITHUB_WORKSPACE" "$RUNNER_TEMP/build_output/v1.30.0.zip"
+        unzip -l "$RUNNER_TEMP/build_output/v1.30.0.zip" | tail -5
+    - name: Upload module zip
+      uses: actions/upload-artifact@v4
+      with:
+        name: module-zip
+        path: ${{ runner.temp }}/build_output/v1.30.0.zip
+        if-no-files-found: error
     - name: Cache dependencies
-      uses: actions/cache@v3.0.2
+      uses: actions/cache@v4
       with:
         path: .cache
         key: ${{ runner.os }}-${{ hashFiles('integration_test.go') }}
     - name: Test
-      run: go test -v -timeout=60m -count=1 -failfast integration_test.go
+      run: USE_BAZEL_VERSION=6.1.0 go test -v -timeout=60m -count=1 -failfast integration_test.go
